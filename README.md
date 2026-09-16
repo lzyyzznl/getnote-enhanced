@@ -2,7 +2,7 @@
 
 把 **得到大脑（Get笔记）** 的笔记同步进 Obsidian，并补上上游插件没有做透的部分：语义召回、深度原文（录音转写 / 时间线 / 会议待办 / 链接原文 / 附件索引）、以及把 Obsidian 笔记推回云端。
 
-本仓库 fork 自 [`springrain1/get-to-obsidian`](https://github.com/springrain1/get-to-obsidian)（MIT），保留其 git 历史，沿用它已建立的**文件契约**（`uid` 前置字段、`<!-- getnote:content:start/end -->` 可写区标记、目录命名习惯），因此存量同步文件可以平滑接管。OpenAPI 通道代码为本仓库实现（上游仓库只公开了旧的 Playwright/ZIP 通道源码，API 通道未公开）。
+本仓库 fork 自 [`springrain1/get-to-obsidian`](https://github.com/springrain1/get-to-obsidian)（MIT），保留其 git 历史，沿用它已建立的**文件契约**（`uid` 前置字段、`<!-- getnote:content:start/end -->` 可写区标记、目录命名习惯）。存量文件的接管方式是**按 `uid` 认领**：同步时先查本地索引、再查本插件推导出的路径，都落空时扫描 vault 中带 `uid` 前置字段的文件，命中即改写索引并就地更新，不会在推导路径另建副本；被认领文件的本地正文同样按「云端更新则覆盖、否则保留」处理。OpenAPI 通道代码为本仓库实现（上游仓库只公开了旧的 Playwright/ZIP 通道源码，API 通道未公开）。
 
 ---
 

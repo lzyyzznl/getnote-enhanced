@@ -14,13 +14,13 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { TFile, createVaultBackedApp } from 'obsidian';
+import { TFile, createVaultBackedApp, normalizePath } from 'obsidian';
 
 import { ApiClient } from '../src/api/client';
 import { GetNoteEndpoints } from '../src/api/endpoints';
 import { PullEngine } from '../src/sync/pull';
 import { PushEngine } from '../src/sync/push';
-import { extractWritableBody, renderNoteMarkdown } from '../src/sync/render';
+import { buildNotePath, extractWritableBody, renderNoteMarkdown } from '../src/sync/render';
 import { defaultGetNoteSettings } from '../src/types';
 
 const passed = [];
@@ -72,6 +72,152 @@ function buildHost(vaultRoot) {
 	return { host, app, settings, endpoints, pull: host.pull, push: host.push, apiClient };
 }
 
+/** Vault path the journal points at, or `null` when the note was never pulled. */
+function pulledPath(settings, noteId) {
+	const marker = settings.index[noteId];
+	if (marker === undefined) return null;
+	const separator = marker.lastIndexOf('|');
+	return separator < 0 ? marker : marker.slice(0, separator);
+}
+
+async function readPulledFile({ app, settings, noteId }) {
+	const vaultPath = pulledPath(settings, noteId);
+	if (vaultPath === null) return '';
+	const file = app.vault.getAbstractFileByPath(vaultPath);
+	return file instanceof TFile ? await app.vault.read(file) : '';
+}
+
+/**
+ * Every deep section is asserted against a real production payload: the newest
+ * notes are scanned for the first one carrying each field. The scan costs one
+ * `note/detail` per note, stops as soon as the four fields that carry data in
+ * practice are covered, and reports what it could not find instead of passing.
+ */
+async function findDeepSamples(endpoints, maxPages = 2) {
+	const samples = {};
+	let cursor = '';
+	let scanned = 0;
+	for (let page = 1; page <= maxPages; page++) {
+		const listing = await endpoints.listNotes({ cursor });
+		for (const note of listing.notes) {
+			scanned++;
+			const detail = await endpoints.getNote(note.noteId);
+			if (samples.linkOriginal === undefined && (detail.webPage?.content ?? '').length > 0) samples.linkOriginal = detail;
+			if (samples.transcript === undefined && (detail.audio?.original ?? '').length > 0) samples.transcript = detail;
+			if (samples.timeline === undefined && (detail.timeline?.moments ?? []).some((moment) => (moment.text ?? '').trim().length > 0)) samples.timeline = detail;
+			if (samples.attachments === undefined && (detail.attachments ?? []).length > 0) samples.attachments = detail;
+			if (samples.meetingTodos === undefined && (detail.meetingTodos?.items ?? []).length > 0) samples.meetingTodos = detail;
+			if (samples.quickNote === undefined && (detail.quickNote ?? '').trim().length > 0) samples.quickNote = detail;
+			if (['linkOriginal', 'transcript', 'timeline', 'attachments'].every((field) => samples[field] !== undefined)) {
+				return { samples, scanned };
+			}
+		}
+		if (!listing.hasMore || listing.cursor.length === 0) break;
+		cursor = listing.cursor;
+	}
+	return { samples, scanned };
+}
+
+/** Asserts `## 原文` / `## 转写` / `## 时间线` / `## 附件` against real notes, not fixtures. */
+async function exerciseDeepContent({ app, settings, pull, endpoints }) {
+	const { samples, scanned } = await findDeepSamples(endpoints);
+	const present = ['linkOriginal', 'transcript', 'timeline', 'meetingTodos', 'quickNote', 'attachments'].filter((field) => samples[field] !== undefined);
+	passed.push({
+		step: 'deep.samples',
+		detail: `扫描 ${scanned} 条笔记，命中字段：${present.length > 0 ? present.join('/') : '无'}`,
+	});
+
+	if (samples.linkOriginal) {
+		const note = samples.linkOriginal;
+		await pull.syncNote(note.noteId);
+		const markdown = await readPulledFile({ app, settings, noteId: note.noteId });
+		check(markdown.includes('## 原文'), 'deep.linkOriginal', `《${note.title}》web_page.content ${note.webPage.content.length} 字已渲染`);
+	}
+	if (samples.transcript) {
+		const note = samples.transcript;
+		await pull.syncNote(note.noteId);
+		const markdown = await readPulledFile({ app, settings, noteId: note.noteId });
+		check(markdown.includes('## 转写'), 'deep.transcript', `《${note.title}》audio.original ${note.audio.original.length} 字已渲染`);
+	}
+	if (samples.timeline) {
+		const note = samples.timeline;
+		await pull.syncNote(note.noteId);
+		const markdown = await readPulledFile({ app, settings, noteId: note.noteId });
+		check(markdown.includes('## 时间线'), 'deep.timeline', `《${note.title}》timeline.moments ${note.timeline.moments.length} 个时刻已渲染`);
+	}
+	if (samples.attachments) {
+		const note = samples.attachments;
+		const report = await pull.syncNote(note.noteId);
+		const markdown = await readPulledFile({ app, settings, noteId: note.noteId });
+		const files = typeof app.vault.getFiles === 'function' ? app.vault.getFiles() : app.vault.getMarkdownFiles();
+		const downloaded = files.filter((file) => file.path.includes(note.noteId));
+		check(markdown.includes('## 附件') && downloaded.length > 0, 'deep.attachments', `《${note.title}》附件索引 ${note.attachments.length} 项，落盘 ${downloaded.length} 个（report.attachments=${report.attachments}）`);
+	}
+	const missing = ['linkOriginal', 'transcript', 'timeline', 'attachments', 'meetingTodos', 'quickNote'].filter((field) => samples[field] === undefined);
+	if (missing.length > 0) {
+		passed.push({ step: 'deep.noSample', detail: `账号内无可渲染样本：${missing.join('/')} —— 未对生产数据实测，仅合成 note 覆盖` });
+	}
+
+	// Sections without a production sample in the account still get their render
+	// path exercised, on a synthetic payload, and are labelled as such.
+	const syntheticDeep = renderNoteMarkdown(
+		{
+			noteId: '1900000000000000002',
+			title: '深度区块合成样本',
+			content: '合成正文',
+			noteType: 'meeting',
+			createdAt: '2026-09-16 10:00:00',
+			updatedAt: '2026-09-16 10:00:00',
+			tags: [],
+			topics: [],
+			source: '',
+			entryType: '',
+			shareId: '',
+			childrenIds: [],
+			childrenCount: 0,
+			isChildNote: false,
+			parentNoteId: '',
+			attachments: [],
+			webPage: { content: '合成链接原文' },
+			audio: { original: '合成转写文本', playUrl: 'https://example.com/voice', duration: 60 },
+			quickNote: '合成快捷笔记',
+			timeline: { moments: [{ text: '合成时刻', startMs: 1000, endMs: 2000 }] },
+			meetingTodos: { items: [{ text: '合成待办', completed: false }] },
+		},
+		{ settings: defaultGetNoteSettings(), attachmentPaths: new Map(), localLinks: new Map() },
+	);
+	const syntheticSections = ['## 原文', '## 转写', '## 时间线', '## 会议待办', '## 快捷笔记'].filter((section) => syntheticDeep.includes(section));
+	check(syntheticSections.length === 5, 'render.deep.synthetic', `合成 note 渲染出 ${syntheticSections.length}/5 个深度区块：${syntheticSections.join(' ')}`);
+}
+
+/**
+ * Takeover check: a file this channel already wrote, sitting at a path the
+ * current path rules would not produce, must be adopted through its `uid`
+ * instead of being duplicated at the derived path.
+ */
+async function exerciseAdoption({ app, settings, pull, endpoints, vaultRoot, sample }) {
+	const note = await endpoints.getNote(sample.noteId);
+	const legacyPath = normalizePath(`get/legacy-import/旧路径-${note.noteId}.md`);
+	// Seeded through the vault API, exactly as a sync from an older build (or a
+	// manual import) would have left it on disk.
+	await app.vault.createFolder('get/legacy-import');
+	await app.vault.create(
+		legacyPath,
+		`---\nuid: ${note.noteId}\nmodified: 2099-01-01 00:00:00\n---\n\n<!-- getnote:content:start -->\n本地正文：接管后必须保留\n<!-- getnote:content:end -->\n`,
+	);
+
+	const report = await pull.syncNote(note.noteId);
+	const derivedPath = normalizePath(buildNotePath(note, settings));
+	check(
+		app.vault.getAbstractFileByPath(derivedPath) === null,
+		'adopt.noDuplicate',
+		`未在推导路径 ${derivedPath} 新建副本（created=${report.created} updated=${report.updated}）`,
+	);
+	const legacyText = await fs.readFile(path.join(vaultRoot, legacyPath), 'utf8').catch(() => '');
+	check(legacyText.includes('本地正文：接管后必须保留'), 'adopt.localBodyKept', '旧路径文件的本地正文被保留');
+	check(pulledPath(settings, note.noteId) === legacyPath, 'adopt.indexed', `日志已指向旧路径（${pulledPath(settings, note.noteId)}）`);
+}
+
 async function exerciseWritePath({ vaultRoot, endpoints, push }) {
 	const draftVaultPath = 'get/push-test.md';
 	const draftAbsolutePath = path.join(vaultRoot, draftVaultPath);
@@ -109,7 +255,7 @@ async function exerciseWritePath({ vaultRoot, endpoints, push }) {
 
 async function main() {
 	const vaultRoot = requireEnv('GETNOTE_SMOKE_VAULT');
-	const { app, endpoints, pull, push } = buildHost(vaultRoot);
+	const { app, endpoints, pull, push, settings } = buildHost(vaultRoot);
 
 	const quota = await endpoints.getQuota();
 	check(quota !== null, 'quota', quota ? `读取剩余 ${quota.read.daily.remaining}/${quota.read.daily.limit}，写入剩余 ${quota.write.daily.remaining}/${quota.write.daily.limit}` : '未返回配额数据');
@@ -121,6 +267,9 @@ async function main() {
 
 	const detail = await endpoints.getNote(sample.noteId);
 	check(detail.noteId === sample.noteId, 'detail', `详情与列表一致（${detail.noteType}）`);
+
+	// Runs before the first pull so the vault is still empty but for the seeded file.
+	if (page.notes[1]) await exerciseAdoption({ app, settings, pull, endpoints, vaultRoot, sample: page.notes[1] });
 
 	const report = await pull.syncNote(sample.noteId, (message) => passed.push({ step: 'pull.progress', detail: message }));
 	check(report.created + report.updated === 1, 'pull.syncNote', `created=${report.created} updated=${report.updated} attachments=${report.attachments} failed=${report.failed.length}`);
@@ -180,11 +329,7 @@ async function main() {
 		check(listing.currentDirectory !== null, 'directory', `当前目录「${listing.currentDirectory?.name ?? ''}」，${listing.resources.length} 个资源`);
 	}
 
-	const deepNote = page.notes.find((note) => note.noteType !== 'plain_text');
-	if (deepNote) {
-		const deepReport = await pull.syncNote(deepNote.noteId);
-		check(deepReport.failed.length === 0, 'pull.deepNote', `${deepNote.noteType} 笔记（${deepReport.created + deepReport.updated} 个文件，${deepReport.attachments} 个附件）`);
-	}
+	await exerciseDeepContent({ app, settings, pull, endpoints });
 
 	if (process.env.GETNOTE_SMOKE_WRITE === '1') {
 		await exerciseWritePath({ vaultRoot, endpoints, push });

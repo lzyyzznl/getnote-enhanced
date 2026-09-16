@@ -1,6 +1,6 @@
 {
 	"name": "getnote-enhanced",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Obsidian plugin: sync 得到大脑 (Get笔记) notes with semantic recall, deep content and push-back.",
 	"main": "main.js",
 	"scripts": {

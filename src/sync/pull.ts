@@ -2,7 +2,7 @@ import { TFile, normalizePath } from 'obsidian';
 
 import { GetNoteApiError } from '../api/client';
 import { GetNotePluginHost } from '../host';
-import { GetNoteChannelSettings, Note, NoteListPage } from '../types';
+import { GetNoteChannelSettings, Note, NoteListPage, UID_FIELD } from '../types';
 import {
 	RenderContext,
 	attachmentTargetPath,
@@ -39,6 +39,13 @@ interface RunState {
 	/** Set when the API refuses the whole account (quota / membership). */
 	aborted: boolean;
 	dirty: boolean;
+	/** `uid` -> vault path, built on the first journal/derived-path miss and reused for the run. */
+	uidIndex?: Map<string, string>;
+}
+
+/** `metadataCache` frontmatter is a cheap pre-filter: no `uid` key means no read is needed. */
+function declaresUid(frontmatter: Record<string, unknown> | undefined): boolean {
+	return frontmatter !== undefined && UID_FIELD in frontmatter;
 }
 
 /** Index values are `"<vaultPath>|<updatedAt>"`; entries written before the marker existed hold a bare path. */
@@ -337,7 +344,7 @@ export class PullEngine {
 		onProgress?.(preserve ? `更新（保留本地正文）：${label}` : `更新（覆盖云端正文）：${label}`);
 	}
 
-	/** The journaled path first, then the derived path when its `uid` confirms ownership. */
+	/** The journaled path first, then the derived path, then any file claiming the note's `uid`. */
 	private async resolveExistingFile(note: Note, state: RunState): Promise<{ file: TFile; text: string } | null> {
 		const journaled = readIndexPath(state.index.get(note.noteId) ?? '');
 		if (journaled.length > 0) {
@@ -349,7 +356,39 @@ export class PullEngine {
 			const text = await this.host.app.vault.read(derived);
 			if (readFrontmatterUid(text) === note.noteId) return { file: derived, text };
 		}
-		return null;
+		// A file written under a path this version does not derive — an older plugin
+		// build, a renamed folder, an import — is still ours when its `uid` matches;
+		// adopting it beats creating a second copy of the same note.
+		const adoptedPath = (await this.uidIndexFor(state)).get(note.noteId);
+		if (adoptedPath === undefined) return null;
+		const adopted = this.host.app.vault.getAbstractFileByPath(adoptedPath);
+		if (!(adopted instanceof TFile)) return null;
+		return { file: adopted, text: await this.host.app.vault.read(adopted) };
+	}
+
+	/**
+	 * Vault-wide `uid` -> path map for one run. Frontmatter is inspected through
+	 * the metadata cache when the file is indexed, and the raw text is read only
+	 * for files that declare a `uid`: a numeric YAML scalar would lose snowflake
+	 * digits, so the id always comes from the literal text.
+	 */
+	private async uidIndexFor(state: RunState): Promise<Map<string, string>> {
+		if (state.uidIndex !== undefined) return state.uidIndex;
+		const vault = this.host.app.vault;
+		const cache = this.host.app.metadataCache;
+		const indexed = typeof cache?.getFileCache === 'function' ? cache : null;
+		const found = new Map<string, string>();
+		for (const file of vault.getMarkdownFiles()) {
+			const fileCache = indexed?.getFileCache(file);
+			// An indexed file without a `uid` key settles without a read; a file the
+			// cache does not know yet (e.g. right after launch) must still be read,
+			// or an existing copy would be missed and duplicated.
+			if (fileCache && !declaresUid(fileCache.frontmatter)) continue;
+			const uid = readFrontmatterUid(await vault.cachedRead(file));
+			if (uid.length > 0 && !found.has(uid)) found.set(uid, file.path);
+		}
+		state.uidIndex = found;
+		return found;
 	}
 
 	private mark(state: RunState, note: Note, path: string): void {

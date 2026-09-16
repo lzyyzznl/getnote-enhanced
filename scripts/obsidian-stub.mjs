@@ -5,7 +5,7 @@
  * `obsidian` package, so the API, render and sync code paths can be exercised
  * against the live service from a plain Node process. UI classes are inert.
  */
-import { promises as fs } from 'node:fs';
+import { promises as fs, readFileSync } from 'node:fs';
 import * as nodePath from 'node:path';
 
 export async function requestUrl(options) {
@@ -324,6 +324,23 @@ export function createVaultBackedApp(rootDir) {
 		},
 	};
 	const metadataCache = {
+		/**
+		 * Obsidian indexes frontmatter in memory; the stand-in parses the leading
+		 * block on demand. Values stay raw text, which is what the sync engine
+		 * treats as authoritative for snowflake ids anyway.
+		 */
+		getFileCache(file) {
+			if (!vault.__files.has(normalizePath(file.path))) return null;
+			const text = readFileSync(absolute(file.path), 'utf8');
+			const block = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---/.exec(text);
+			if (!block) return {};
+			const frontmatter = {};
+			for (const line of block[1].split('\n')) {
+				const match = /^([A-Za-z0-9_-]+)[ \t]*:[ \t]*(.*?)[ \t\r]*$/.exec(line);
+				if (match) frontmatter[match[1]] = match[2].replace(/^["']|["']$/g, '');
+			}
+			return { frontmatter };
+		},
 		getFirstLinkpathDest(linkpath) {
 			const target = normalizePath(`${linkpath}.md`);
 			return vault.__files.has(target) ? new TFile(target) : null;

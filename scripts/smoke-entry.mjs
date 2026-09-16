@@ -216,6 +216,8 @@ async function exerciseAdoption({ app, settings, pull, endpoints, vaultRoot, sam
 	const legacyText = await fs.readFile(path.join(vaultRoot, legacyPath), 'utf8').catch(() => '');
 	check(legacyText.includes('本地正文：接管后必须保留'), 'adopt.localBodyKept', '旧路径文件的本地正文被保留');
 	check(pulledPath(settings, note.noteId) === legacyPath, 'adopt.indexed', `日志已指向旧路径（${pulledPath(settings, note.noteId)}）`);
+	const persisted = JSON.parse(await fs.readFile(path.join(vaultRoot, '.smoke-settings.json'), 'utf8'));
+	check(String(persisted.index?.[note.noteId] ?? '').startsWith(legacyPath), 'adopt.persisted', `落盘的设置文件同样指向旧路径（${persisted.index?.[note.noteId]}）`);
 }
 
 async function exerciseWritePath({ vaultRoot, endpoints, push }) {

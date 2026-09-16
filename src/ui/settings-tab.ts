@@ -1,8 +1,17 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, SuggestModal } from 'obsidian';
 
 import { GetNoteApiError } from '../api/client';
 import { GetNotePluginHost } from '../host';
-import { AttachmentTypeOptions, DeepContentOptions, GetNoteChannelSettings, KBTopic } from '../types';
+import {
+	AttachmentTypeOptions,
+	DeepContentOptions,
+	GetNoteChannelSettings,
+	KB_SCOPE_LABELS,
+	KB_SCOPES,
+	KBScope,
+	KBTopic,
+} from '../types';
+import { runDeviceLogin } from './oauth-login';
 
 /** Human readable error text; `request_id` is appended when the API sent one. */
 function failureMessage(error: unknown): string {
@@ -34,6 +43,33 @@ const DEEP_CONTENT_ROWS: Array<{ key: keyof DeepContentOptions; name: string; de
 	{ key: 'attachments', name: '附件', desc: '附件清单，已下载到本地时渲染为内部链接。' },
 	{ key: 'summary', name: 'AI 摘要', desc: '正文中的 AI 摘要（content）。' },
 ];
+
+/** 一次性内容导入的知识库选择器；列表由调用方按当前范围取好再传入。 */
+class KnowledgeBasePicker extends SuggestModal<KBTopic> {
+	constructor(
+		app: App,
+		private readonly topics: KBTopic[],
+		private readonly onPick: (topic: KBTopic) => void,
+	) {
+		super(app);
+		this.setPlaceholder('选择要导入内容的知识库');
+	}
+
+	override getSuggestions(query: string): KBTopic[] {
+		const needle = query.trim().toLowerCase();
+		if (needle.length === 0) return this.topics;
+		return this.topics.filter((topic) => topic.name.toLowerCase().includes(needle));
+	}
+
+	override renderSuggestion(topic: KBTopic, el: HTMLElement): void {
+		el.createEl('div', { text: topic.name });
+		el.createEl('small', { text: `${topic.noteCount} 条笔记 · ${topic.scope}` });
+	}
+
+	override onChooseSuggestion(topic: KBTopic): void {
+		this.onPick(topic);
+	}
+}
 
 /** Settings tab for the 得到大脑 (Get笔记) channel. */
 export class GetNoteSettingTab extends PluginSettingTab {
@@ -96,6 +132,20 @@ export class GetNoteSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
+			.setName('笔记网页地址')
+			.setDesc('笔记链接（source）使用的前缀，留空则按 API 地址自动推导，仅测试环境需要改。')
+			.addText((text) => {
+				text
+					.setPlaceholder('https://www.biji.com')
+					.setValue(settings.webBase)
+					.onChange(async (value) => {
+						settings.webBase = value.trim();
+						this.host.refreshCredentials();
+						await this.persist();
+					});
+			});
+
+		new Setting(containerEl)
 			.setName('测试连接')
 			.setDesc('用当前凭证请求一次配额接口，验证 API Key 与 Client ID 是否可用。')
 			.addButton((button) => {
@@ -109,6 +159,24 @@ export class GetNoteSettingTab extends PluginSettingTab {
 								? `连接成功，今日读取额度剩余 ${quota.read.daily.remaining}/${quota.read.daily.limit}。`
 								: '连接成功，但接口未返回配额信息。',
 						);
+					} catch (error) {
+						new Notice(failureMessage(error));
+					} finally {
+						button.setDisabled(false);
+					}
+				});
+			});
+
+		new Setting(containerEl)
+			.setName('浏览器授权')
+			.setDesc(
+				'在浏览器里确认授权码自动换取 API Key，需要先填上面「Client ID」——它必须是你自己在得到大脑开放平台创建的应用，插件无法代你申请；没有应用时可以继续只用 API Key。',
+			)
+			.addButton((button) => {
+				button.setButtonText('浏览器授权').onClick(async () => {
+					button.setDisabled(true);
+					try {
+						await runDeviceLogin(this.host);
 					} catch (error) {
 						new Notice(failureMessage(error));
 					} finally {
@@ -355,6 +423,109 @@ export class GetNoteSettingTab extends PluginSettingTab {
 					await this.persist();
 				});
 			});
+
+		containerEl.createEl('h3', { text: '知识库' });
+
+		new Setting(containerEl)
+			.setName('知识库范围')
+			.setDesc('知识库列表与内容导入的检索范围；书籍库、顾客档案、团队空间是独立的库，必须选中对应范围才能看到。')
+			.addDropdown((dropdown) => {
+				for (const scope of KB_SCOPES) dropdown.addOption(scope, KB_SCOPE_LABELS[scope]);
+				dropdown.setValue(settings.kbScope);
+				dropdown.onChange(async (value) => {
+					settings.kbScope = value as KBScope;
+					await this.persist();
+				});
+			});
+
+		containerEl.createEl('h3', { text: '内容导入' });
+
+		new Setting(containerEl)
+			.setName('启用内容导入')
+			.setDesc('博主内容与直播内容不在笔记接口里，需要单独抓取；开启后随同步一起导入。')
+			.addToggle((toggle) => {
+				toggle.setValue(settings.content.enabled).onChange(async (value) => {
+					settings.content.enabled = value;
+					await this.persist();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName('博主内容')
+			.setDesc('导入已关注博主发布的文章。')
+			.addToggle((toggle) => {
+				toggle.setValue(settings.content.bloggers).onChange(async (value) => {
+					settings.content.bloggers = value;
+					await this.persist();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName('直播内容')
+			.setDesc('导入已关注直播的场次记录。')
+			.addToggle((toggle) => {
+				toggle.setValue(settings.content.lives).onChange(async (value) => {
+					settings.content.lives = value;
+					await this.persist();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName('导入目录')
+			.setDesc('导入内容的存放目录，留空表示跟随笔记目录。')
+			.addText((text) => {
+				text
+					.setPlaceholder('留空表示跟随笔记目录')
+					.setValue(settings.content.folder)
+					.onChange(async (value) => {
+						settings.content.folder = value.trim();
+						await this.persist();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('立即导入')
+			.setDesc('先选择一个知识库，再导入其中的博主内容与直播内容。')
+			.addButton((button) => {
+				button.setButtonText('立即导入').onClick(async () => {
+					button.setDisabled(true);
+					importStatus.setText('读取知识库…');
+					try {
+						const scoped = await this.host.endpoints.listKnowledgeBases(settings.kbScope);
+						if (scoped.length === 0) {
+							importStatus.setText('');
+							new Notice(`${KB_SCOPE_LABELS[settings.kbScope]}范围内没有知识库。`);
+							return;
+						}
+						new KnowledgeBasePicker(this.app, scoped, (topic) => {
+							void this.importContent(topic, importStatus);
+						}).open();
+					} catch (error) {
+						importStatus.setText('');
+						new Notice(failureMessage(error));
+					} finally {
+						button.setDisabled(false);
+					}
+				});
+			});
+		const importStatus = containerEl.createDiv({ cls: 'getnote-settings-status' });
+	}
+
+	/** 导入一个知识库的博主/直播内容，计数落到状态行，失败条目单独提示。 */
+	private async importContent(topic: KBTopic, status: HTMLElement): Promise<void> {
+		status.setText(`正在导入 ${topic.name}…`);
+		try {
+			const report = await this.host.content.importKnowledgeBaseContent(topic.topicId, topic.name, (message) =>
+				status.setText(message),
+			);
+			const summary = `导入 ${report.imported} 条 · 跳过 ${report.skipped} 条 · 失败 ${report.failed.length} 条`;
+			status.setText(summary);
+			new Notice(`${topic.name}：${summary}`);
+			report.failed.slice(0, 3).forEach((failure) => new Notice(`${failure.title}：${failure.error}`, 8000));
+		} catch (error) {
+			status.setText('');
+			new Notice(failureMessage(error));
+		}
 	}
 
 	/** Settings are saved after every change; a failed write must not go unnoticed. */

@@ -181,6 +181,14 @@ export class PullEngine {
 				if (note.noteId.length === 0 || seen.has(note.noteId)) continue;
 				seen.add(note.noteId);
 				fresh++;
+				// `knowledge/notes` answers with `edit_time`, which `normaliseNote` maps
+				// to `updatedAt`, so the same journal pre-check `syncLatest` runs settles
+				// an unchanged note here — without paying for a `note/detail` request.
+				const stored = state.index.get(note.noteId);
+				if (stored !== undefined && !isRemoteNewer(note.updatedAt, readIndexUpdatedAt(stored))) {
+					state.report.skipped++;
+					continue;
+				}
 				await this.pullNote(note.noteId, state, onProgress);
 				if (state.aborted) break;
 			}

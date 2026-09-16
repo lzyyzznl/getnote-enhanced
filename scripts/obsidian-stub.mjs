@@ -9,9 +9,13 @@ import { promises as fs, readFileSync } from 'node:fs';
 import * as nodePath from 'node:path';
 
 export async function requestUrl(options) {
+	// Obsidian's `contentType` sets the request content type; the stub honours it so
+	// multipart uploads carry their boundary exactly as they do in the app.
+	const requestHeaders = { ...(options.headers ?? {}) };
+	if (options.contentType !== undefined) requestHeaders['Content-Type'] = options.contentType;
 	const response = await fetch(options.url, {
 		method: options.method ?? 'GET',
-		headers: options.headers ?? {},
+		headers: requestHeaders,
 		body: options.body,
 	});
 	const headers = {};
@@ -265,6 +269,12 @@ export function createVaultBackedApp(rootDir) {
 			const path = typeof file === 'string' ? file : file.path;
 			return fs.readFile(absolute(path), 'utf8');
 		},
+		async readBinary(file) {
+			const path = typeof file === 'string' ? file : file.path;
+			const bytes = await fs.readFile(absolute(path));
+			// The real API hands back an ArrayBuffer, which is what uploads expect.
+			return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+		},
 		async cachedRead(file) {
 			return vault.read(file);
 		},
@@ -342,6 +352,9 @@ export function createVaultBackedApp(rootDir) {
 			return { frontmatter };
 		},
 		getFirstLinkpathDest(linkpath) {
+			const direct = normalizePath(linkpath);
+			// `![[pic.png]]` resolves to a real file; a bare `[[note]]` falls back to `.md`.
+			if (vault.__files.has(direct)) return new TFile(direct);
 			const target = normalizePath(`${linkpath}.md`);
 			return vault.__files.has(target) ? new TFile(target) : null;
 		},

@@ -131,3 +131,191 @@
 	font-size: var(--font-ui-smaller);
 	white-space: pre-wrap;
 }
+
+/* Knowledge-base panel: browse and organise cloud libraries. */
+
+.getnote-kb-view {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	padding: 4px 2px;
+}
+
+.getnote-kb-scope,
+.getnote-kb-source,
+.getnote-kb-actions,
+.getnote-kb-toolbar,
+.getnote-kb-tabs {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-wrap: wrap;
+}
+
+.getnote-kb-scope-label,
+.getnote-kb-toolbar-label {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.getnote-kb-source-btn.is-active,
+.getnote-kb-tab.is-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.getnote-kb-topics {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	max-height: 40vh;
+	overflow-y: auto;
+}
+
+.getnote-kb-topic {
+	display: flex;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 4px 6px;
+	border-radius: var(--radius-s);
+	cursor: pointer;
+}
+
+.getnote-kb-topic:hover {
+	background: var(--background-modifier-hover);
+}
+
+.getnote-kb-topic.is-selected {
+	background: var(--background-modifier-active-hover);
+}
+
+.getnote-kb-topic-name,
+.getnote-kb-row-title,
+.getnote-kb-post-title {
+	font-weight: var(--font-semibold);
+}
+
+.getnote-kb-topic-meta,
+.getnote-kb-row-meta,
+.getnote-kb-row-excerpt,
+.getnote-kb-post-meta,
+.getnote-kb-status,
+.getnote-note-actions-status,
+.getnote-oauth-status,
+.getnote-oauth-uri {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.getnote-kb-body,
+.getnote-kb-pane {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	overflow-y: auto;
+}
+
+.getnote-kb-row {
+	padding: 6px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+}
+
+.getnote-kb-row-head {
+	display: flex;
+	justify-content: space-between;
+	gap: 8px;
+}
+
+.getnote-kb-row-actions {
+	display: flex;
+	gap: 6px;
+	margin-top: 4px;
+	flex-wrap: wrap;
+}
+
+.getnote-kb-breadcrumb {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	flex-wrap: wrap;
+}
+
+.getnote-kb-crumb {
+	padding: 0 2px;
+	background: none;
+	border: none;
+	box-shadow: none;
+	color: var(--text-accent);
+	cursor: pointer;
+}
+
+.getnote-kb-crumb-sep {
+	color: var(--text-muted);
+}
+
+.getnote-kb-post {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 2px 0 2px 12px;
+}
+
+.getnote-kb-post-title {
+	flex: 1 1 auto;
+}
+
+.getnote-kb-empty,
+.getnote-note-actions-empty {
+	color: var(--text-muted);
+}
+
+.getnote-kb-error,
+.getnote-note-actions-status-error,
+.getnote-oauth-error {
+	color: var(--text-error);
+}
+
+.getnote-kb-input {
+	width: 100%;
+}
+
+/* Note actions: delete, tag manager and share dialogs. */
+
+.getnote-note-actions-modal {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.getnote-note-actions-tags {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	max-height: 240px;
+	overflow-y: auto;
+}
+
+.getnote-note-actions-share {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.getnote-note-actions-share-url {
+	word-break: break-all;
+	color: var(--text-accent);
+}
+
+/* OAuth device flow dialog. */
+
+.getnote-oauth-code {
+	font-family: var(--font-monospace);
+	font-size: 1.4em;
+	font-weight: var(--font-bold);
+	letter-spacing: 0.1em;
+}
+
+.getnote-oauth-uri {
+	word-break: break-all;
+}

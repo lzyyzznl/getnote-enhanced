@@ -22,6 +22,7 @@
 
 import { normalizePath } from 'obsidian';
 
+import { webBaseFor } from '../api/client';
 import {
 	CONTENT_END,
 	CONTENT_START,
@@ -117,7 +118,7 @@ const FRONTMATTER_OPEN = /^---[ \t]*\r?\n/;
 const UID_LINE = new RegExp(`^\\s*${UID_FIELD}\\s*:\\s*(.*)$`);
 
 /** `targetFolder/subfolder/file.md`; empty segments fall away, vault root stays relative. */
-function joinVaultPath(...segments: string[]): string {
+export function joinVaultPath(...segments: string[]): string {
 	const parts = segments
 		.map((segment) => segment.replace(/\\/g, '/').trim())
 		.filter((segment) => segment.length > 0 && segment !== '.')
@@ -131,7 +132,7 @@ function joinVaultPath(...segments: string[]): string {
  * Whitespace collapses after the strip so removals do not leave double spaces,
  * and newlines become spaces instead of gluing words together.
  */
-function sanitiseFileName(raw: string, maxLength = MAX_NAME_LENGTH): string {
+export function sanitiseFileName(raw: string, maxLength = MAX_NAME_LENGTH): string {
 	const cleaned = raw
 		.replace(INVALID_FILE_CHARS, '')
 		.replace(/\s+/g, ' ')
@@ -187,7 +188,7 @@ function yamlScalar(value: string): string {
 	return `"${quoted}"`;
 }
 
-function buildFrontmatter(note: Note): string {
+function buildFrontmatter(note: Note, settings: GetNoteChannelSettings): string {
 	const lines: string[] = [];
 	if (note.noteId) lines.push(`${UID_FIELD}: ${yamlScalar(note.noteId)}`);
 	if (note.title.trim()) lines.push(`title: ${yamlScalar(note.title)}`);
@@ -201,7 +202,8 @@ function buildFrontmatter(note: Note): string {
 		for (const tag of tags) lines.push(`  - ${yamlScalar(tag)}`);
 	}
 
-	lines.push(`source: ${yamlScalar(note.noteId ? `https://www.biji.com/note/${note.noteId}` : 'biji')}`);
+	const webBase = webBaseFor(settings.apiBase, settings.webBase);
+	lines.push(`source: ${yamlScalar(note.noteId ? `${webBase}/note/${note.noteId}` : webBase)}`);
 	const externalUrl = (note.webPage?.url ?? '').trim();
 	if (externalUrl) lines.push(`url: ${yamlScalar(externalUrl)}`);
 	const topic = (note.topics[0]?.name ?? '').trim();
@@ -432,7 +434,7 @@ function buildSections(note: Note, context: RenderContext, body: string): string
 /** Full markdown of a note: frontmatter, writable region, derived sections. */
 export function renderNoteMarkdown(note: Note, context: RenderContext): string {
 	const body = buildWritableBody(note, context);
-	const parts: string[] = [buildFrontmatter(note)];
+	const parts: string[] = [buildFrontmatter(note, context.settings)];
 	const reference = buildReferenceBlock(note, context, body);
 	if (reference.length > 0) parts.push(reference);
 	parts.push(body ? `${CONTENT_START}\n\n${body}\n\n${CONTENT_END}` : `${CONTENT_START}\n${CONTENT_END}`);

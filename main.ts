@@ -2,10 +2,13 @@ import { App, Modal, Notice, Plugin, SuggestModal, TFile, WorkspaceLeaf, addIcon
 
 import { ApiClient, GetNoteApiError } from './src/api/client';
 import { GetNoteEndpoints } from './src/api/endpoints';
-import { GetNotePluginHost, RECALL_VIEW_TYPE } from './src/host';
+import { GetNotePluginHost, KB_VIEW_TYPE, RECALL_VIEW_TYPE } from './src/host';
 import { PullEngine, SyncReport } from './src/sync/pull';
 import { PushEngine } from './src/sync/push';
+import { ContentEngine } from './src/sync/content';
 import { GetNoteChannelSettings, KBTopic, defaultGetNoteSettings } from './src/types';
+import { KnowledgeBaseView } from './src/ui/kb-panel';
+import { openDeleteNoteModal, openShareModal, openTagManagerModal } from './src/ui/note-actions';
 import { RecallView } from './src/ui/recall-view';
 import { renderQuotaPanel } from './src/ui/quota-status';
 import { GetNoteSettingTab } from './src/ui/settings-tab';
@@ -86,10 +89,12 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 		apiKey: this.getNoteSettings.apiKey,
 		clientId: this.getNoteSettings.clientId,
 		apiBase: this.getNoteSettings.apiBase,
+		webBase: this.getNoteSettings.webBase,
 	}));
 	endpoints: GetNoteEndpoints = new GetNoteEndpoints(this.apiClient);
 	pull: PullEngine = new PullEngine(this);
 	push: PushEngine = new PushEngine(this);
+	content: ContentEngine = new ContentEngine(this);
 	private progressNotice: Notice | null = null;
 
 	override async onload(): Promise<void> {
@@ -98,16 +103,22 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 		addIcon('get-notes', GET_NOTES_ICON);
 		this.addRibbonIcon('get-notes', '同步得到大脑笔记', () => void this.runSyncLatest());
 		this.addRibbonIcon('search', '得到大脑语义召回', () => void this.openRecallView());
+		this.addRibbonIcon('folder-tree', '打开知识库面板', () => void this.openKnowledgeBaseView());
 
 		this.registerView(RECALL_VIEW_TYPE, (leaf: WorkspaceLeaf) => new RecallView(leaf, this));
+		this.registerView(KB_VIEW_TYPE, (leaf: WorkspaceLeaf) => new KnowledgeBaseView(leaf, this));
 		this.addSettingTab(new GetNoteSettingTab(this.app, this));
 
 		this.addCommand({ id: 'sync-latest-notes', name: '同步最新笔记', callback: () => void this.runSyncLatest() });
 		this.addCommand({ id: 'sync-knowledge-base', name: '同步指定知识库', callback: () => void this.pickKnowledgeBaseAndSync() });
 		this.addCommand({ id: 'open-recall-view', name: '打开语义召回', callback: () => void this.openRecallView() });
+		this.addCommand({ id: 'open-kb-panel', name: '打开知识库面板', callback: () => void this.openKnowledgeBaseView() });
+		this.addCommand({ id: 'sync-kb-content', name: '导入知识库内容（博主/直播）', callback: () => void this.pickKnowledgeBaseAndImportContent() });
 		this.addCommand({ id: 'recall-selection', name: '以选中文本语义召回', editorCallback: (editor) => void this.recallText(editor.getSelection()) });
 		this.addCommand({ id: 'push-active-note', name: '推送当前笔记到得到大脑', checkCallback: (checking) => this.withActiveFile(checking, (file) => this.pushFile(file)) });
 		this.addCommand({ id: 'share-active-note', name: '生成当前笔记的分享链接', checkCallback: (checking) => this.withActiveFile(checking, (file) => this.shareFile(file)) });
+		this.addCommand({ id: 'delete-cloud-note', name: '删除云端笔记（移入回收站）', checkCallback: (checking) => this.withActiveFile(checking, (file) => openDeleteNoteModal(this, file)) });
+		this.addCommand({ id: 'manage-tags', name: '管理当前笔记的标签', checkCallback: (checking) => this.withActiveFile(checking, (file) => openTagManagerModal(this, file)) });
 		this.addCommand({ id: 'check-quota', name: '查看接口配额', callback: () => new QuotaModal(this.app, this).open() });
 
 		this.registerEvent(
@@ -116,6 +127,26 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 				if (selection.length === 0) return;
 				menu.addItem((item) => {
 					item.setTitle('以选中文本语义召回').setIcon('search').onClick(() => void this.recallText(selection));
+				});
+			}),
+		);
+
+		// Note-level actions also belong on the file menu: a command-palette-only
+		// delete/tag entry is not where anyone looks for a file operation.
+		this.registerEvent(
+			this.app.workspace.on('file-menu', (menu, file) => {
+				if (!(file instanceof TFile) || file.extension !== 'md') return;
+				menu.addItem((item) => {
+					item.setTitle('推送当前笔记到得到大脑').setIcon('upload').onClick(() => void this.pushFile(file));
+				});
+				menu.addItem((item) => {
+					item.setTitle('生成分享链接').setIcon('link').onClick(() => void this.shareFile(file));
+				});
+				menu.addItem((item) => {
+					item.setTitle('管理云端标签').setIcon('tags').onClick(() => openTagManagerModal(this, file));
+				});
+				menu.addItem((item) => {
+					item.setTitle('删除云端笔记（移入回收站）').setIcon('trash').onClick(() => openDeleteNoteModal(this, file));
 				});
 			}),
 		);
@@ -133,6 +164,7 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 
 	override onunload(): void {
 		this.app.workspace.detachLeavesOfType(RECALL_VIEW_TYPE);
+		this.app.workspace.detachLeavesOfType(KB_VIEW_TYPE);
 	}
 
 	async loadSettings(): Promise<void> {
@@ -144,6 +176,8 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 			attachmentTypes: { ...defaults.attachmentTypes, ...(stored?.getnote?.attachmentTypes ?? {}) },
 			deepContent: { ...defaults.deepContent, ...(stored?.getnote?.deepContent ?? {}) },
 			recall: { ...defaults.recall, ...(stored?.getnote?.recall ?? {}) },
+			content: { ...defaults.content, ...(stored?.getnote?.content ?? {}) },
+			contentIndex: { ...(stored?.getnote?.contentIndex ?? {}) },
 			index: { ...(stored?.getnote?.index ?? {}) },
 		};
 	}
@@ -205,11 +239,41 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 		}
 	}
 
+	async pickKnowledgeBaseAndImportContent(): Promise<void> {
+		try {
+			const topics = await this.endpoints.listKnowledgeBases();
+			if (topics.length === 0) {
+				new Notice('没有可导入的知识库。');
+				return;
+			}
+			new KnowledgeBasePicker(this.app, topics, (topic) => {
+				void this.content
+					.importKnowledgeBaseContent(topic.topicId, topic.name, (message) => this.reportProgress(message))
+					.then((report) =>
+						this.finishProgress(
+							`${topic.name} 导入完成：导入 ${report.imported} · 跳过 ${report.skipped} · 失败 ${report.failed.length}`,
+						),
+					)
+					.catch((error: unknown) => this.finishProgress(`导入失败：${describeFailure(error)}`));
+			}).open();
+		} catch (error: unknown) {
+			new Notice(`知识库读取失败：${describeFailure(error)}`);
+		}
+	}
+
 	async openRecallView(): Promise<void> {
 		const existing = this.app.workspace.getLeavesOfType(RECALL_VIEW_TYPE);
 		const leaf = existing.length > 0 ? existing[0] : this.app.workspace.getRightLeaf(false);
 		if (!leaf) return;
 		await leaf.setViewState({ type: RECALL_VIEW_TYPE, active: true });
+		this.app.workspace.revealLeaf(leaf);
+	}
+
+	async openKnowledgeBaseView(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(KB_VIEW_TYPE);
+		const leaf = existing.length > 0 ? existing[0] : this.app.workspace.getRightLeaf(false);
+		if (!leaf) return;
+		await leaf.setViewState({ type: KB_VIEW_TYPE, active: true });
 		this.app.workspace.revealLeaf(leaf);
 	}
 
@@ -237,10 +301,6 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 	}
 
 	async shareFile(file: TFile): Promise<void> {
-		try {
-			new Notice(`分享链接：${await this.push.shareFile(file)}`, 10_000);
-		} catch (error: unknown) {
-			new Notice(`生成分享链接失败：${describeFailure(error)}`, 8000);
-		}
+		await openShareModal(this, file);
 	}
 }

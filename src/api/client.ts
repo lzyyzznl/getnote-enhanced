@@ -18,6 +18,8 @@ export interface GetNoteCredentials {
 	apiKey: string;
 	clientId: string;
 	apiBase: string;
+	/** Optional note web base override; empty derives it from `apiBase`. */
+	webBase?: string;
 }
 
 export class GetNoteApiError extends Error {
@@ -27,6 +29,12 @@ export class GetNoteApiError extends Error {
 	readonly httpStatus: number;
 	readonly requestId: string;
 	readonly rateLimit: QuotaSnapshot | null;
+	/** `error.field` / `error.constraint` / `error.expected_type` for validation failures. */
+	readonly field: string;
+	readonly constraint: string;
+	readonly expectedType: string;
+	/** `error.membership_url` — the purchase page a non-member is sent to. */
+	readonly membershipUrl: string;
 
 	constructor(init: {
 		message: string;
@@ -36,6 +44,10 @@ export class GetNoteApiError extends Error {
 		httpStatus?: number;
 		requestId?: string;
 		rateLimit?: QuotaSnapshot | null;
+		field?: string;
+		constraint?: string;
+		expectedType?: string;
+		membershipUrl?: string;
 	}) {
 		super(init.message);
 		this.name = 'GetNoteApiError';
@@ -45,6 +57,10 @@ export class GetNoteApiError extends Error {
 		this.httpStatus = init.httpStatus ?? 0;
 		this.requestId = init.requestId ?? '';
 		this.rateLimit = init.rateLimit ?? null;
+		this.field = init.field ?? '';
+		this.constraint = init.constraint ?? '';
+		this.expectedType = init.expectedType ?? '';
+		this.membershipUrl = init.membershipUrl ?? '';
 	}
 
 	/** Quota exhaustion / non-member states must not be retried and must gate the UI. */
@@ -174,6 +190,34 @@ export function normaliseApiBase(apiBase: string): string {
 	return `${trimmed}/open/api/v1`;
 }
 
+/**
+ * Note web base for `source:` links. Staging API hosts serve a staging site, so
+ * the base is derived from `apiBase` unless the user overrode it.
+ */
+export function webBaseFor(apiBase: string, override = ''): string {
+	const explicit = override.trim().replace(/\/+$/, '');
+	if (explicit.length > 0) return explicit;
+	const host = apiBase.toLowerCase();
+	if (host.includes('dev.didatrip.com') || host.includes('openapi-dev.biji.com')) {
+		return 'http://biji.dev.didatrip.com';
+	}
+	return 'https://www.biji.com';
+}
+
+/**
+ * OAuth endpoints hang off the same `/open/api/v1` prefix as the resource routes
+ * (the reference CLI normalises *towards* that suffix, not away from it), so a bare
+ * host root has to gain it before the path is appended — otherwise the request hits
+ * the website and answers with HTML.
+ */
+export function oauthUrl(apiBase: string, path: string): string {
+	const trimmed = apiBase.trim().replace(/\/+$/, '');
+	if (trimmed.length === 0) return `https://openapi.biji.com/open/api/v1${path}`;
+	if (trimmed.endsWith('/open/api/v1')) return `${trimmed}${path}`;
+	if (trimmed.endsWith('/open')) return `${trimmed}/api/v1${path}`;
+	return `${trimmed}/open/api/v1${path}`;
+}
+
 export interface ApiRequestOptions {
 	method?: 'GET' | 'POST';
 	query?: Record<string, string | number | undefined>;
@@ -197,6 +241,12 @@ export class ApiClient {
 
 	getQuota(): QuotaSnapshot | null {
 		return this.quota;
+	}
+
+	/** Environment-correct note site, e.g. for links written into note frontmatter. */
+	getWebBase(): string {
+		const credentials = this.readCredentials();
+		return webBaseFor(credentials.apiBase, credentials.webBase ?? '');
 	}
 
 	/** Reason why calls are currently refused, empty when the client is healthy. */
@@ -249,6 +299,73 @@ export class ApiClient {
 			Authorization: credentials.apiKey.trim(),
 			'X-Client-ID': credentials.clientId.trim(),
 		};
+	}
+
+	/**
+	 * Unauthenticated POST for the OAuth device flow. That flow lives beside the
+	 * API root and answers `success:false` for states the caller must read
+	 * (`authorization_pending`), so the raw envelope is returned untouched.
+	 */
+	async requestOAuth(path: string, body: unknown): Promise<Record<string, unknown>> {
+		const response = await requestUrl({
+			url: oauthUrl(this.readCredentials().apiBase, path),
+			method: 'POST',
+			contentType: 'application/json',
+			body: JSON.stringify(body),
+			throw: false,
+		});
+		return response.text.length > 0 ? (parseJsonSafe(response.text) as Record<string, unknown>) : {};
+	}
+
+	/**
+	 * Multipart POST for the OSS image upload; `requestUrl` takes raw bytes, so the
+	 * body is assembled here. Field order is the caller's contract (OSS signature
+	 * rules require key → OSSAccessKeyId → policy → signature → callback →
+	 * Content-Type → file), and the file part must repeat the policy's MIME type.
+	 */
+	async postMultipart(
+		url: string,
+		fields: Array<[string, string]>,
+		file: { field: string; filename: string; contentType: string; bytes: ArrayBuffer },
+	): Promise<string> {
+		const boundary = `----getnote${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`;
+		const encoder = new TextEncoder();
+		const parts: Uint8Array[] = [];
+		for (const [name, value] of fields) {
+			parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
+		}
+		parts.push(
+			encoder.encode(
+				`--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename}"\r\n` +
+					`Content-Type: ${file.contentType}\r\n\r\n`,
+			),
+		);
+		parts.push(new Uint8Array(file.bytes));
+		parts.push(encoder.encode(`\r\n--${boundary}--\r\n`));
+
+		let total = 0;
+		for (const part of parts) total += part.byteLength;
+		const body = new Uint8Array(total);
+		let offset = 0;
+		for (const part of parts) {
+			body.set(part, offset);
+			offset += part.byteLength;
+		}
+
+		const response = await requestUrl({
+			url,
+			method: 'POST',
+			contentType: `multipart/form-data; boundary=${boundary}`,
+			body: body.buffer as ArrayBuffer,
+			throw: false,
+		});
+		if (response.status >= 400) {
+			throw new GetNoteApiError({
+				message: `上传失败（HTTP ${response.status}）：${response.text.slice(0, 200)}`,
+				httpStatus: response.status,
+			});
+		}
+		return response.text;
 	}
 
 	private buildUrl(path: string, query?: Record<string, string | number | undefined>): string {
@@ -306,14 +423,30 @@ export class ApiClient {
 		const rateLimit = parseQuotaSnapshot(rawError.rate_limit);
 		if (rateLimit) this.publishQuota(rateLimit);
 		const reason = String(rawError.reason ?? '');
+		const field = String(rawError.field ?? '');
+		const constraint = String(rawError.constraint ?? '');
+		const expectedType = String(rawError.expected_type ?? '');
+		const membershipUrl = String(rawError.membership_url ?? '');
+		// The envelope carries more than the message: validation failures name the
+		// offending field and non-membership carries the purchase link. Both are
+		// folded into the message so every existing Notice shows them.
+		const details: string[] = [];
+		if (field.length > 0) details.push(constraint.length > 0 ? `${field}：${constraint}` : field);
+		if (expectedType.length > 0) details.push(`期望 ${expectedType}`);
+		if (membershipUrl.length > 0) details.push(`开通会员：${membershipUrl}`);
+		const base = String(rawError.message ?? reason ?? '请求失败');
 		const error = new GetNoteApiError({
-			message: String(rawError.message ?? reason ?? '请求失败'),
+			message: details.length > 0 ? `${base}（${details.join('；')}）` : base,
 			code: Number(rawError.code ?? 0) || 0,
 			reason,
 			retryable: rawError.retryable === true,
 			httpStatus,
 			requestId,
 			rateLimit,
+			field,
+			constraint,
+			expectedType,
+			membershipUrl,
 		});
 		if (error.isQuotaExhausted || error.isNotMember) this.blockedReason = reason || 'quota_day';
 		return error;

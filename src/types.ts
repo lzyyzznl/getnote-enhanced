@@ -171,6 +171,120 @@ export interface KBDirectoryListing {
 	resources: KBResourceEntry[];
 }
 
+/**
+ * Knowledge-base buckets. An unscoped list answers with `DEFAULT` only, so the
+ * special libraries (books, customer files, team spaces) need an explicit scope.
+ */
+export type KBScope = 'DEFAULT' | 'BOOKSPACE' | 'CUSTOMER' | 'TEAMSPACE';
+
+export const KB_SCOPES: KBScope[] = ['DEFAULT', 'BOOKSPACE', 'CUSTOMER', 'TEAMSPACE'];
+
+export const KB_SCOPE_LABELS: Record<KBScope, string> = {
+	DEFAULT: '默认知识库',
+	BOOKSPACE: '书籍库',
+	CUSTOMER: '顾客档案',
+	TEAMSPACE: '团队空间',
+};
+
+/** A blogger subscribed inside a knowledge base (`knowledge/bloggers`). */
+export interface KBBlogger {
+	followId: string;
+	accountName: string;
+	accountAvatar: string;
+	notesCount: number;
+	platform: string;
+	hookState: string;
+	followLink: string;
+	followTime: string;
+}
+
+/** A blogger post as listed by `knowledge/blogger/contents`. */
+export interface KBBloggerPost {
+	postId: string;
+	title: string;
+	summary: string;
+	postType: string;
+	publishTime: string;
+}
+
+/** A live session as listed by `knowledge/lives`. */
+export interface KBLive {
+	liveId: string;
+	name: string;
+	status: string;
+}
+
+/** Detail shape shared by `blogger/content/detail` and `live/detail` (flat `data`). */
+export interface KBPostDetail {
+	postId: string;
+	ownerName: string;
+	title: string;
+	subtitle: string;
+	summary: string;
+	/** `post_media_text` — the real original text, not the AI summary. */
+	mediaText: string;
+	postUrl: string;
+	publishTime: string;
+}
+
+/** Subscription result shared by the blogger and live follow endpoints. */
+export interface KBFollowResult {
+	followId: string;
+	url: string;
+}
+
+/** Credentials for one OSS upload (`resource/image/upload_token`). */
+export interface ImageUploadToken {
+	host: string;
+	objectKey: string;
+	accessId: string;
+	policy: string;
+	signature: string;
+	callback: string;
+	accessUrl: string;
+	contentType: string;
+}
+
+/** OAuth 2.0 device authorization challenge (`oauth/device/code`). */
+export interface DeviceCodeChallenge {
+	code: string;
+	userCode: string;
+	verificationUri: string;
+	expiresIn: number;
+	interval: number;
+}
+
+/** Credentials returned once the device authorization completes. */
+export interface DeviceCredentials {
+	apiKey: string;
+	clientId: string;
+	expiresAt: number;
+}
+
+/** One poll attempt of the device flow: only `success` and the terminal errors stop it. */
+export type DevicePollResult =
+	| { state: 'pending' }
+	| { state: 'success'; credentials: DeviceCredentials }
+	| { state: 'error'; message: string };
+
+/** Which knowledge-base content track a file was imported from. */
+export type ContentKind = 'blogger' | 'live';
+
+/** One imported blogger post or live session. */
+export interface ContentEntry {
+	kind: ContentKind;
+	postId: string;
+	topicId: string;
+	topicName: string;
+	ownerName: string;
+	title: string;
+	subtitle: string;
+	summary: string;
+	mediaText: string;
+	postUrl: string;
+	publishTime: string;
+}
+
 export interface QuotaBucket {
 	limit: number;
 	used: number;
@@ -239,6 +353,16 @@ export interface RecallerOptions {
 	autoOpen: boolean;
 }
 
+/** Blogger / live import track: knowledge-base content that is not a note. */
+export interface ContentOptions {
+	/** Import blogger posts and live sessions into the vault. */
+	enabled: boolean;
+	bloggers: boolean;
+	lives: boolean;
+	/** Vault folder for imported content; empty = below `targetFolder`. */
+	folder: string;
+}
+
 export interface GetNoteChannelSettings {
 	/** API key, `gk_live_xxx`. Stored in the vault's plugin data.json only. */
 	apiKey: string;
@@ -246,6 +370,10 @@ export interface GetNoteChannelSettings {
 	clientId: string;
 	/** API base, override for staging. Defaults to production. */
 	apiBase: string;
+	/** Note web base for `source:` links; empty derives it from `apiBase`. */
+	webBase: string;
+	/** Scope used by the knowledge-base list and the sync picker. */
+	kbScope: KBScope;
 
 	/** Notes are written below this vault folder. */
 	targetFolder: string;
@@ -272,6 +400,10 @@ export interface GetNoteChannelSettings {
 	index: Record<string, string>;
 	lastSyncAt: number;
 	recall: RecallerOptions;
+	/** Blogger / live import track. */
+	content: ContentOptions;
+	/** Journal for imported content: post id -> "<vault path>|<publishTime>". */
+	contentIndex: Record<string, string>;
 }
 
 export function defaultGetNoteSettings(): GetNoteChannelSettings {
@@ -279,6 +411,8 @@ export function defaultGetNoteSettings(): GetNoteChannelSettings {
 		apiKey: '',
 		clientId: '',
 		apiBase: 'https://openapi.biji.com/open',
+		webBase: '',
+		kbScope: 'DEFAULT',
 		targetFolder: 'get',
 		folderLayout: 'by-type',
 		attachmentFolder: 'get attachment',
@@ -300,6 +434,8 @@ export function defaultGetNoteSettings(): GetNoteChannelSettings {
 		index: {},
 		lastSyncAt: 0,
 		recall: { topK: 5, topicId: '', autoOpen: true },
+		content: { enabled: false, bloggers: true, lives: true, folder: '' },
+		contentIndex: {},
 	};
 }
 

@@ -1,6 +1,14 @@
 import { ApiClient, GetNoteApiError, parseQuotaSnapshot } from './client';
 import {
+	DeviceCodeChallenge,
+	DevicePollResult,
+	ImageUploadToken,
+	KBBlogger,
+	KBBloggerPost,
+	KBFollowResult,
 	KBDirectoryListing,
+	KBLive,
+	KBPostDetail,
 	KBTopic,
 	Note,
 	NoteListPage,
@@ -31,10 +39,15 @@ import {
 const NOTE_PAGE_SIZE = 20;
 /** Safety valve for the `page`/`has_more` loops. */
 const MAX_PAGES = 20;
+/** `knowledge/note/batch-add` rejects more than this many notes per request. */
+const KB_NOTE_BATCH = 20;
+/** Device flow: server-suggested poll interval fallback, in seconds. */
+const DEVICE_POLL_DEFAULT_SECONDS = 5;
+/** Terminal device-flow states; anything else keeps the caller polling. */
+const DEVICE_TERMINAL_PATTERNS = ['rejected', 'expired_token', 'already_consumed'];
 const RECALL_TOP_K_MIN = 1;
 const RECALL_TOP_K_MAX = 10;
 const RECALL_TOP_K_DEFAULT = 3;
-const NOTE_WEB_BASE = 'https://www.biji.com/note/';
 
 interface RawNoteDetailData {
 	note?: NotePayload;
@@ -145,6 +158,7 @@ function normaliseTaskStatus(status: string | undefined): TaskStatus {
 	return status === 'done' ? 'success' : 'pending';
 }
 
+/** Raw recall item -> normalised result; `note_url` may be absent. */
 function normaliseRecallResult(raw: RawRecallItem): RecallResult {
 	const noteId = String(raw.note_id ?? '');
 	return {
@@ -154,7 +168,7 @@ function normaliseRecallResult(raw: RawRecallItem): RecallResult {
 		content: raw.content ?? '',
 		createdAt: raw.created_at ?? '',
 		score: raw.score ?? 0,
-		noteUrl: raw.note_url || (noteId.length > 0 ? `${NOTE_WEB_BASE}${noteId}` : ''),
+		noteUrl: raw.note_url ?? '',
 	};
 }
 
@@ -242,6 +256,124 @@ export function normaliseNote(payload: NotePayload): Note {
 	return note;
 }
 
+interface RawMutationData {
+	id?: string | number;
+	topic_id?: string | number;
+}
+
+interface RawBlogger {
+	follow_id?: string | number;
+	follow_id_str?: string;
+	account_name?: string;
+	account_avatar?: string;
+	notes_count?: number;
+	platform?: string;
+	hook_state?: string;
+	follow_link?: string;
+	follow_time?: string;
+}
+
+interface RawBloggerListData {
+	bloggers?: RawBlogger[];
+	has_more?: boolean;
+	total?: number;
+}
+
+interface RawBloggerPost {
+	post_id_alias?: string;
+	post_name?: string;
+	post_title?: string;
+	post_summary?: string;
+	post_type?: string;
+	post_publish_time?: string;
+}
+
+interface RawBloggerPostListData {
+	contents?: RawBloggerPost[];
+	has_more?: boolean;
+	total?: number;
+}
+
+interface RawLive {
+	live_id?: string;
+	name?: string;
+	status?: string;
+}
+
+interface RawLiveListData {
+	lives?: RawLive[];
+	has_more?: boolean;
+	total?: number;
+}
+
+/** `blogger/content/detail` and `live/detail` both answer with a flat `data`. */
+interface RawPostDetail {
+	post_id_alias?: string;
+	post_name?: string;
+	post_title?: string;
+	post_subtitle?: string;
+	post_summary?: string;
+	post_media_text?: string;
+	post_url?: string;
+	post_publish_time?: string;
+}
+
+interface RawFollowData {
+	follow_id?: string | number;
+	follow_id_str?: string;
+	url?: string;
+}
+
+interface RawUploadToken {
+	host?: string;
+	object_key?: string;
+	accessid?: string;
+	policy?: string;
+	signature?: string;
+	callback?: string;
+	access_url?: string;
+	oss_content_type?: string;
+}
+
+interface RawDeviceCodeData {
+	code?: string;
+	user_code?: string;
+	verification_uri?: string;
+	expires_in?: number;
+	interval?: number;
+}
+
+interface RawDeviceTokenData {
+	api_key?: string;
+	client_id?: string;
+	expires_at?: number;
+}
+
+/**
+ * Both track kinds answer with the same flat shape; `post_id_alias` is the live id.
+ *
+ * The detail payload is not a superset of the listing: a video post comes back with
+ * `post_id_alias` and `post_title` set to empty strings, keeping the readable name in
+ * `post_name`. Empty strings are therefore treated as absent (a `??` fallback would
+ * keep them and the next fetch would fail with 参数错误), and the id to reuse stays
+ * the one the caller already had.
+ */
+function normalisePostDetail(raw: RawPostDetail, fallbackId: string): KBPostDetail {
+	const alias = (raw.post_id_alias ?? '').trim();
+	const title = (raw.post_title ?? '').trim();
+	const name = (raw.post_name ?? '').replace(/\s+/g, ' ').trim();
+	return {
+		postId: alias.length > 0 ? alias : fallbackId,
+		ownerName: name,
+		title: title.length > 0 ? title : name,
+		subtitle: raw.post_subtitle ?? '',
+		summary: raw.post_summary ?? '',
+		mediaText: raw.post_media_text ?? '',
+		postUrl: raw.post_url ?? '',
+		publishTime: raw.post_publish_time ?? '',
+	};
+}
+
 export class GetNoteEndpoints {
 	private readonly client: ApiClient;
 
@@ -279,7 +411,7 @@ export class GetNoteEndpoints {
 			method: 'POST',
 			body: { query, top_k: clampTopK(topK) },
 		});
-		return (data.results ?? []).map(normaliseRecallResult);
+		return this.decorateRecall((data.results ?? []).map(normaliseRecallResult));
 	}
 
 	async recallKnowledgeBase(topicId: string, query: string, topK: number): Promise<RecallResult[]> {
@@ -287,7 +419,7 @@ export class GetNoteEndpoints {
 			method: 'POST',
 			body: { topic_id: topicId, query, top_k: clampTopK(topK) },
 		});
-		return (data.results ?? []).map(normaliseRecallResult);
+		return this.decorateRecall((data.results ?? []).map(normaliseRecallResult));
 	}
 
 	async listKnowledgeBases(scope = ''): Promise<KBTopic[]> {
@@ -359,6 +491,8 @@ export class GetNoteEndpoints {
 		tags?: string[];
 		topicId?: string;
 		parentId?: string;
+		/** Retry-safe key: reuse the same value when retrying one creation. */
+		clientRequestId?: string;
 	}): Promise<SaveNoteResult> {
 		const data = await this.client.request<RawSaveData>('/resource/note/save', {
 			method: 'POST',
@@ -371,6 +505,7 @@ export class GetNoteEndpoints {
 				tags: request.tags,
 				topic_id: request.topicId,
 				parent_id: request.parentId,
+				client_request_id: request.clientRequestId,
 			},
 		});
 		const tasks = data.tasks ?? [];
@@ -426,6 +561,260 @@ export class GetNoteEndpoints {
 			status: normaliseTaskStatus(data.status),
 			noteId: String(data.note_id ?? ''),
 		};
+	}
+
+	/** `knowledge/create` answers with an opaque payload, so callers re-list. */
+	async createKnowledgeBase(name: string, description = ''): Promise<void> {
+		await this.client.request<unknown>('/resource/knowledge/create', {
+			method: 'POST',
+			body: { name, description: description.length > 0 ? description : undefined },
+		});
+	}
+
+	/** `note/batch-add` caps one request at 20 notes, so the list is chunked here. */
+	async addNotesToKnowledgeBase(topicId: string, noteIds: string[], directoryId = ''): Promise<number> {
+		let added = 0;
+		for (let index = 0; index < noteIds.length; index += KB_NOTE_BATCH) {
+			const chunk = noteIds.slice(index, index + KB_NOTE_BATCH);
+			await this.client.request<unknown>('/resource/knowledge/note/batch-add', {
+				method: 'POST',
+				body: {
+					topic_id: topicId,
+					directory_id: directoryId.length > 0 ? directoryId : undefined,
+					note_ids: chunk,
+				},
+			});
+			added += chunk.length;
+		}
+		return added;
+	}
+
+	async removeNotesFromKnowledgeBase(topicId: string, noteIds: string[]): Promise<void> {
+		await this.client.request<unknown>('/resource/knowledge/note/remove', {
+			method: 'POST',
+			body: { topic_id: topicId, note_ids: noteIds },
+		});
+	}
+
+	async createDirectory(topicId: string, name: string, parentId = ''): Promise<string> {
+		const data = await this.client.request<RawMutationData>('/resource/knowledge/directory/create', {
+			method: 'POST',
+			body: { topic_id: topicId, parent_id: parentId.length > 0 ? parentId : undefined, name },
+		});
+		return String(data?.id ?? '');
+	}
+
+	/** `update` doubles as rename and move: send only the field that changes. */
+	async updateDirectory(
+		topicId: string,
+		directoryId: string,
+		changes: { name?: string; parentId?: string },
+	): Promise<void> {
+		await this.client.request<unknown>('/resource/knowledge/directory/update', {
+			method: 'POST',
+			body: {
+				topic_id: topicId,
+				directory_id: directoryId,
+				name: changes.name,
+				parent_id: changes.parentId,
+			},
+		});
+	}
+
+	async deleteDirectory(topicId: string, directoryId: string): Promise<void> {
+		await this.client.request<unknown>('/resource/knowledge/directory/delete', {
+			method: 'POST',
+			body: { topic_id: topicId, directory_id: directoryId },
+		});
+	}
+
+	/** `note/tags/add` only appends; removal needs the tag id, not its name. */
+	async deleteTag(noteId: string, tagId: string): Promise<void> {
+		await this.client.request<unknown>('/resource/note/tags/delete', {
+			method: 'POST',
+			body: { note_id: noteId, tag_id: tagId },
+		});
+	}
+
+	/** Recall hits may omit `note_url`; the environment-correct link is filled in here. */
+	private decorateRecall(results: RecallResult[]): RecallResult[] {
+		const base = `${this.client.getWebBase()}/note/`;
+		return results.map((result) =>
+			result.noteUrl.length > 0 || result.noteId.length === 0 ? result : { ...result, noteUrl: `${base}${result.noteId}` },
+		);
+	}
+
+	async listBloggers(topicId: string, page = 1): Promise<{ bloggers: KBBlogger[]; hasMore: boolean; total: number }> {
+		const data = await this.client.request<RawBloggerListData>('/resource/knowledge/bloggers', {
+			query: { topic_id: topicId, page },
+		});
+		return {
+			bloggers: (data.bloggers ?? []).map((raw) => ({
+				followId: String(raw.follow_id_str || raw.follow_id || ''),
+				accountName: raw.account_name ?? '',
+				accountAvatar: raw.account_avatar ?? '',
+				notesCount: raw.notes_count ?? 0,
+				platform: raw.platform ?? '',
+				hookState: raw.hook_state ?? '',
+				followLink: raw.follow_link ?? '',
+				followTime: raw.follow_time ?? '',
+			})),
+			hasMore: data.has_more === true,
+			total: data.total ?? 0,
+		};
+	}
+
+	async followBlogger(topicId: string, link: string, platform = ''): Promise<KBFollowResult> {
+		const data = await this.client.request<RawFollowData>('/resource/knowledge/blogger/follow', {
+			method: 'POST',
+			body: { topic_id: topicId, link, platform: platform.length > 0 ? platform : undefined },
+		});
+		return { followId: String(data.follow_id_str || data.follow_id || ''), url: data.url ?? '' };
+	}
+
+	async listBloggerPosts(
+		topicId: string,
+		followId: string,
+		page = 1,
+	): Promise<{ posts: KBBloggerPost[]; hasMore: boolean; total: number }> {
+		const data = await this.client.request<RawBloggerPostListData>('/resource/knowledge/blogger/contents', {
+			query: { topic_id: topicId, follow_id: followId, page },
+		});
+		return {
+			posts: (data.contents ?? []).map((raw) => ({
+				postId: (raw.post_id_alias ?? '').trim(),
+				// Same empty-`post_title` story as the detail payload: `post_name` is
+				// the fallback the listing itself uses for video posts.
+				title: (raw.post_title ?? '').trim() || (raw.post_name ?? '').replace(/\s+/g, ' ').trim(),
+				summary: raw.post_summary ?? '',
+				postType: raw.post_type ?? '',
+				publishTime: raw.post_publish_time ?? '',
+			})),
+			hasMore: data.has_more === true,
+			total: data.total ?? 0,
+		};
+	}
+
+	async getBloggerPost(topicId: string, postId: string): Promise<KBPostDetail> {
+		const data = await this.client.request<RawPostDetail>('/resource/knowledge/blogger/content/detail', {
+			query: { topic_id: topicId, post_id: postId },
+		});
+		return normalisePostDetail(data, postId);
+	}
+
+	async listLives(topicId: string, page = 1): Promise<{ lives: KBLive[]; hasMore: boolean; total: number }> {
+		const data = await this.client.request<RawLiveListData>('/resource/knowledge/lives', {
+			query: { topic_id: topicId, page },
+		});
+		return {
+			lives: (data.lives ?? []).map((raw) => ({
+				liveId: raw.live_id ?? '',
+				name: raw.name ?? '',
+				status: raw.status ?? '',
+			})),
+			hasMore: data.has_more === true,
+			total: data.total ?? 0,
+		};
+	}
+
+	async getLive(topicId: string, liveId: string): Promise<KBPostDetail> {
+		const data = await this.client.request<RawPostDetail>('/resource/knowledge/live/detail', {
+			query: { topic_id: topicId, live_id: liveId },
+		});
+		return normalisePostDetail(data, liveId);
+	}
+
+	async followLive(topicId: string, link: string, platform = ''): Promise<KBFollowResult> {
+		const data = await this.client.request<RawFollowData>('/resource/knowledge/live/follow', {
+			method: 'POST',
+			body: { topic_id: topicId, link, platform: platform.length > 0 ? platform : undefined },
+		});
+		return { followId: String(data.follow_id_str || data.follow_id || ''), url: data.url ?? '' };
+	}
+
+	/** Step 1 of the device flow; the `clientId` is the user's own OAuth app. */
+	async requestDeviceCode(clientId: string): Promise<DeviceCodeChallenge> {
+		const payload = await this.client.requestOAuth('/oauth/device/code', { client_id: clientId });
+		const data = (payload.data ?? {}) as RawDeviceCodeData;
+		const code = data.code ?? '';
+		if (payload.success !== true || code.length === 0) {
+			throw new GetNoteApiError({ message: '授权请求失败：接口未返回设备码，请检查 Client ID。' });
+		}
+		return {
+			code,
+			userCode: data.user_code ?? '',
+			verificationUri: data.verification_uri ?? '',
+			expiresIn: data.expires_in ?? 0,
+			interval: data.interval !== undefined && data.interval > 0 ? data.interval : DEVICE_POLL_DEFAULT_SECONDS,
+		};
+	}
+
+	/**
+	 * Step 2: one poll attempt, no sleeping here — the caller owns the interval and
+	 * deadline. Anything that is not a terminal state stays `pending`, mirroring the
+	 * reference CLI, so a transient server error cannot abort an authorization.
+	 */
+	async pollDeviceToken(clientId: string, code: string): Promise<DevicePollResult> {
+		const payload = await this.client.requestOAuth('/oauth/token', {
+			grant_type: 'device_code',
+			client_id: clientId,
+			code,
+		});
+		const data = (payload.data ?? {}) as RawDeviceTokenData;
+		const apiKey = data.api_key ?? '';
+		if (payload.success === true && apiKey.length > 0) {
+			return {
+				state: 'success',
+				credentials: { apiKey, clientId: data.client_id || clientId, expiresAt: data.expires_at ?? 0 },
+			};
+		}
+		const raw = JSON.stringify(payload);
+		if (raw.includes('authorization_pending')) return { state: 'pending' };
+		const terminal = DEVICE_TERMINAL_PATTERNS.find((pattern) => raw.includes(pattern));
+		if (terminal !== undefined) {
+			const reason = String(((payload.error ?? {}) as Record<string, unknown>).message ?? terminal);
+			return { state: 'error', message: reason };
+		}
+		return { state: 'pending' };
+	}
+
+	async getImageUploadToken(mimeType: string): Promise<ImageUploadToken> {
+		const data = await this.client.request<RawUploadToken>('/resource/image/upload_token', {
+			query: { mime_type: mimeType, count: 1 },
+		});
+		const token: ImageUploadToken = {
+			host: data?.host ?? '',
+			objectKey: data?.object_key ?? '',
+			accessId: data?.accessid ?? '',
+			policy: data?.policy ?? '',
+			signature: data?.signature ?? '',
+			callback: data?.callback ?? '',
+			accessUrl: data?.access_url ?? '',
+			contentType: data?.oss_content_type ?? mimeType,
+		};
+		if (token.host.length === 0 || token.objectKey.length === 0) {
+			throw new GetNoteApiError({ message: '上传失败：接口未返回上传凭证。' });
+		}
+		return token;
+	}
+
+	/** Uploads one image and returns its public URL, ready for `note/save`'s `image_urls`. */
+	async uploadImage(bytes: ArrayBuffer, fileName: string, mimeType: string): Promise<string> {
+		const token = await this.getImageUploadToken(mimeType);
+		// Field order and the file part's Content-Type are OSS policy requirements.
+		await this.client.postMultipart(
+			token.host,
+			[
+				['key', token.objectKey],
+				['OSSAccessKeyId', token.accessId],
+				['policy', token.policy],
+				['signature', token.signature],
+				['callback', token.callback],
+				['Content-Type', token.contentType],
+			],
+			{ field: 'file', filename: fileName, contentType: token.contentType, bytes },
+		);
+		return token.accessUrl;
 	}
 
 	private async collectKnowledgeBases(path: string, scope: string): Promise<KBTopic[]> {

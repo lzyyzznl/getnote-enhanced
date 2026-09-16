@@ -1,7 +1,7 @@
 {
 	"id": "getnote-enhanced",
 	"name": "GetNote Enhanced",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"minAppVersion": "1.5.0",
 	"description": "Sync 得到大脑 (Get笔记) notes into your vault with semantic recall, deep content (transcripts, timelines, meeting todos) and push-back. Requires a 得到大脑 membership.",
 	"author": "lzyyzznl",

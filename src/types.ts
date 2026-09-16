@@ -235,6 +235,8 @@ export interface RecallerOptions {
 	topK: number;
 	/** Limit recall to a single knowledge base (`topicId`), empty = global. */
 	topicId: string;
+	/** Open the recall sidebar once the workspace is ready, so the panel is not hidden behind a command. */
+	autoOpen: boolean;
 }
 
 export interface GetNoteChannelSettings {
@@ -297,7 +299,7 @@ export function defaultGetNoteSettings(): GetNoteChannelSettings {
 		syncIntervalMinutes: 0,
 		index: {},
 		lastSyncAt: 0,
-		recall: { topK: 5, topicId: '' },
+		recall: { topK: 5, topicId: '', autoOpen: true },
 	};
 }
 

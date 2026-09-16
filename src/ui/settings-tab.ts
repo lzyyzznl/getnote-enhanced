@@ -311,6 +311,16 @@ export class GetNoteSettingTab extends PluginSettingTab {
 		containerEl.createEl('h3', { text: '召回' });
 
 		new Setting(containerEl)
+			.setName('启动时打开召回面板')
+			.setDesc('Obsidian 启动后自动在右侧边栏打开语义召回面板。')
+			.addToggle((toggle) => {
+				toggle.setValue(settings.recall.autoOpen).onChange(async (value) => {
+					settings.recall.autoOpen = value;
+					await this.persist();
+				});
+			});
+
+		new Setting(containerEl)
 			.setName('召回条数')
 			.setDesc('每次语义召回返回的结果数量，接口上限为 10。')
 			.addSlider((slider) => {

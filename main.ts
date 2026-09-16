@@ -121,6 +121,9 @@ export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
 		);
 
 		this.app.workspace.onLayoutReady(() => {
+			// The recall panel is the plugin's main surface; without this it stays
+			// hidden behind a command and the plugin looks settings-only.
+			if (this.getNoteSettings.recall.autoOpen) void this.openRecallView();
 			if (this.getNoteSettings.syncOnStartup) window.setTimeout(() => void this.runSyncLatest(), 2000);
 			if (this.getNoteSettings.syncIntervalMinutes > 0) {
 				this.registerInterval(window.setInterval(() => void this.runSyncLatest(), this.getNoteSettings.syncIntervalMinutes * 60_000));

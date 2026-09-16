@@ -1,169 +1,243 @@
-import { addIcon, Plugin, Notice, ButtonComponent } from 'obsidian';
-import { MainUI } from './lib/ui/main_ui';
-import {  } from './lib/get/importer';
-import {  } from './lib/get/const';
+import { App, Modal, Notice, Plugin, SuggestModal, TFile, WorkspaceLeaf, addIcon } from 'obsidian';
 
-const GET_NOTES_ICON = '<svg xmlns="http://www.w3.org/2000/svg" ' +
-	'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-	'<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>' +
+import { ApiClient, GetNoteApiError } from './src/api/client';
+import { GetNoteEndpoints } from './src/api/endpoints';
+import { GetNotePluginHost, RECALL_VIEW_TYPE } from './src/host';
+import { PullEngine, SyncReport } from './src/sync/pull';
+import { PushEngine } from './src/sync/push';
+import { GetNoteChannelSettings, KBTopic, defaultGetNoteSettings } from './src/types';
+import { RecallView } from './src/ui/recall-view';
+import { renderQuotaPanel } from './src/ui/quota-status';
+import { GetNoteSettingTab } from './src/ui/settings-tab';
+
+const GET_NOTES_ICON =
+	'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+	'stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>' +
 	'<path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>' +
-	'<line x1="16" y1="2" x2="16" y2="22"/>' +
-	'<line x1="8" y1="7" x2="13" y2="7"/>' +
-	'<line x1="8" y1="11" x2="13" y2="11"/>' +
-	'<line x1="8" y1="15" x2="13" y2="15"/>' +
-	'</svg>';
+	'<line x1="16" y1="2" x2="16" y2="22"/><line x1="8" y1="7" x2="13" y2="7"/>' +
+	'<line x1="8" y1="11" x2="13" y2="11"/><line x1="8" y1="15" x2="13" y2="15"/></svg>';
 
-interface GetImporterSettings {
-	getTarget: string,
-	memoTarget: string,
-	optionsMoments: string,
-	optionsCanvas: string,
-	expOptionAllowbilink: boolean,
-	canvasSize: string,
-	mergeByDate: boolean,
-	autoSyncOnStartup: boolean,
-	autoSyncInterval: boolean,
-	lastSyncTime: number,
-	syncedMemoIds: string[],
-	attachmentImport: {
-		image: boolean,
-		audio: boolean,
-		video: boolean,
-		document: boolean
+interface PluginSettings {
+	getnote: GetNoteChannelSettings;
+	[key: string]: unknown;
+}
+
+
+function describeFailure(error: unknown): string {
+	if (error instanceof GetNoteApiError) {
+		return error.requestId.length > 0 ? `${error.message}（request_id: ${error.requestId}）` : error.message;
+	}
+	return error instanceof Error ? error.message : String(error);
+}
+
+function summariseReport(report: SyncReport): string {
+	const parts = [`新增 ${report.created}`, `更新 ${report.updated}`, `跳过 ${report.skipped}`, `附件 ${report.attachments}`];
+	if (report.failed.length > 0) parts.push(`失败 ${report.failed.length}`);
+	return parts.join(' · ');
+}
+
+/** Renders the cached quota snapshot inside a modal. */
+class QuotaModal extends Modal {
+	constructor(app: App, private readonly host: GetNotePluginHost) {
+		super(app);
+	}
+
+	override onOpen(): void {
+		this.contentEl.addClass('getnote-quota-modal');
+		void renderQuotaPanel(this.contentEl, this.host).catch((error: unknown) => {
+			this.contentEl.createEl('p', { text: `配额读取失败：${describeFailure(error)}` });
+		});
+	}
+
+	override onClose(): void {
+		this.contentEl.empty();
 	}
 }
 
-const DEFAULT_SETTINGS: GetImporterSettings = {
-	getTarget: 'get',
-	memoTarget: 'notes',
-	optionsMoments: "copy_with_link",
-	optionsCanvas: "copy_with_content",
-	expOptionAllowbilink: true,
-	canvasSize: 'M',
-	mergeByDate: false,
-	autoSyncOnStartup: false,
-	autoSyncInterval: false,
-	lastSyncTime: 0,
-	syncedMemoIds: [],
-	attachmentImport: {
-		image: true,
-		audio: true,
-		video: true,
-		document: true
+class KnowledgeBasePicker extends SuggestModal<KBTopic> {
+	constructor(
+		app: App,
+		private readonly topics: KBTopic[],
+		private readonly onPick: (topic: KBTopic) => void,
+	) {
+		super(app);
+		this.setPlaceholder('选择要同步的知识库');
+	}
+
+	getSuggestions(query: string): KBTopic[] {
+		const needle = query.trim().toLowerCase();
+		if (needle.length === 0) return this.topics;
+		return this.topics.filter((topic) => topic.name.toLowerCase().includes(needle));
+	}
+
+	renderSuggestion(topic: KBTopic, el: HTMLElement): void {
+		el.createEl('div', { text: topic.name });
+		el.createEl('small', { text: `${topic.noteCount} 条笔记 · ${topic.scope}` });
+	}
+
+	onChooseSuggestion(topic: KBTopic): void {
+		this.onPick(topic);
 	}
 }
 
-export default class GetImporterPlugin extends Plugin {
-	settings: GetImporterSettings;
-	mainUI: MainUI;
-	syncIntervalId: number | null = null;
-	
-	onload() {
-		void (async () => {
+export default class GetNotePlugin extends Plugin implements GetNotePluginHost {
+	getNoteSettings: GetNoteChannelSettings = defaultGetNoteSettings();
+	apiClient: ApiClient = new ApiClient(() => ({
+		apiKey: this.getNoteSettings.apiKey,
+		clientId: this.getNoteSettings.clientId,
+		apiBase: this.getNoteSettings.apiBase,
+	}));
+	endpoints: GetNoteEndpoints = new GetNoteEndpoints(this.apiClient);
+	pull: PullEngine = new PullEngine(this);
+	push: PushEngine = new PushEngine(this);
+	private progressNotice: Notice | null = null;
+
+	override async onload(): Promise<void> {
 		await this.loadSettings();
-		this.mainUI = new MainUI(this.app, this);
 
-		// Get笔记 官方图标 - 矢量化品牌样式
 		addIcon('get-notes', GET_NOTES_ICON);
-		const ribbonIconEl = this.addRibbonIcon('get-notes', 'Get笔记 Importer', (evt: MouseEvent) => {
-			this.mainUI.open();
+		this.addRibbonIcon('get-notes', '同步得到大脑笔记', () => void this.runSyncLatest());
+		this.addRibbonIcon('search', '得到大脑语义召回', () => void this.openRecallView());
+
+		this.registerView(RECALL_VIEW_TYPE, (leaf: WorkspaceLeaf) => new RecallView(leaf, this));
+		this.addSettingTab(new GetNoteSettingTab(this.app, this));
+
+		this.addCommand({ id: 'sync-latest-notes', name: '同步最新笔记', callback: () => void this.runSyncLatest() });
+		this.addCommand({ id: 'sync-knowledge-base', name: '同步指定知识库', callback: () => void this.pickKnowledgeBaseAndSync() });
+		this.addCommand({ id: 'open-recall-view', name: '打开语义召回', callback: () => void this.openRecallView() });
+		this.addCommand({ id: 'recall-selection', name: '以选中文本语义召回', editorCallback: (editor) => void this.recallText(editor.getSelection()) });
+		this.addCommand({ id: 'push-active-note', name: '推送当前笔记到得到大脑', checkCallback: (checking) => this.withActiveFile(checking, (file) => this.pushFile(file)) });
+		this.addCommand({ id: 'share-active-note', name: '生成当前笔记的分享链接', checkCallback: (checking) => this.withActiveFile(checking, (file) => this.shareFile(file)) });
+		this.addCommand({ id: 'check-quota', name: '查看接口配额', callback: () => new QuotaModal(this.app, this).open() });
+
+		this.registerEvent(
+			this.app.workspace.on('editor-menu', (menu, editor) => {
+				const selection = editor.getSelection().trim();
+				if (selection.length === 0) return;
+				menu.addItem((item) => {
+					item.setTitle('以选中文本语义召回').setIcon('search').onClick(() => void this.recallText(selection));
+				});
+			}),
+		);
+
+		this.app.workspace.onLayoutReady(() => {
+			if (this.getNoteSettings.syncOnStartup) window.setTimeout(() => void this.runSyncLatest(), 2000);
+			if (this.getNoteSettings.syncIntervalMinutes > 0) {
+				this.registerInterval(window.setInterval(() => void this.runSyncLatest(), this.getNoteSettings.syncIntervalMinutes * 60_000));
+			}
 		});
+	}
 
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+	override onunload(): void {
+		this.app.workspace.detachLeavesOfType(RECALL_VIEW_TYPE);
+	}
 
-		// Get笔记 Importer Command
-		this.addCommand({
-			id: 'open-get-importer',
-			name: 'Open Get笔记 Importer',
-			callback: () => {
-				this.mainUI.open();
-			},
-		});
+	async loadSettings(): Promise<void> {
+		const stored = (await this.loadData()) as Partial<PluginSettings> | null;
+		const defaults = defaultGetNoteSettings();
+		this.getNoteSettings = {
+			...defaults,
+			...(stored?.getnote ?? {}),
+			attachmentTypes: { ...defaults.attachmentTypes, ...(stored?.getnote?.attachmentTypes ?? {}) },
+			deepContent: { ...defaults.deepContent, ...(stored?.getnote?.deepContent ?? {}) },
+			recall: { ...defaults.recall, ...(stored?.getnote?.recall ?? {}) },
+			index: { ...(stored?.getnote?.index ?? {}) },
+		};
+	}
 
-		// 添加手动触发同步的命令
-		this.addCommand({
-			id: 'sync-get-now',
-			name: 'Sync Get笔记 Now',
-			callback: async () => {
-				await this.syncGet();
-			},
-		});
-		
-		// 启动时自动同步
-		if (this.settings.autoSyncOnStartup) {
-			// 等待 2 秒让 Obsidian 完全加载
-			window.setTimeout(() => {
-				void this.syncGet();
-			}, 2000);
+	async saveSettings(): Promise<void> {
+		await this.saveData({ ...((await this.loadData()) as Record<string, unknown> | null), getnote: this.getNoteSettings });
+	}
+
+	refreshCredentials(): void {
+		this.apiClient.clearBlock();
+	}
+
+	private withActiveFile(checking: boolean, action: (file: TFile) => Promise<unknown>): boolean {
+		const file = this.app.workspace.getActiveFile();
+		if (!file) return false;
+		if (!checking) void action(file).catch((error: unknown) => new Notice(`操作失败：${describeFailure(error)}`));
+		return true;
+	}
+
+	private reportProgress(message: string): void {
+		if (!this.progressNotice) {
+			this.progressNotice = new Notice(message, 0);
+			return;
 		}
-		
-		// 设置定时同步
-		if (this.settings.autoSyncInterval) {
-			this.startAutoSync();
-		}
-		})();
+		this.progressNotice.setMessage(message);
 	}
 
-	
-	onunload() {
-		// 清除定时器
-		if (this.syncIntervalId !== null) {
-			window.clearInterval(this.syncIntervalId);
-			this.syncIntervalId = null;
-		}
+	private finishProgress(message: string): void {
+		this.progressNotice?.hide();
+		this.progressNotice = null;
+		new Notice(message);
 	}
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-	
-	// 开始自动同步
-	startAutoSync() {
-		// 清除现有的定时器
-		if (this.syncIntervalId !== null) {
-			window.clearInterval(this.syncIntervalId);
-		}
-		
-		// 设置每小时同步一次 (3600000ms = 1小时)
-		this.syncIntervalId = window.setInterval(() => {
-			void this.syncGet();
-		}, 3600000);
-	}
-	
-	// 停止自动同步
-	stopAutoSync() {
-		if (this.syncIntervalId !== null) {
-			window.clearInterval(this.syncIntervalId);
-			this.syncIntervalId = null;
-		}
-	}
-	
-	// 同步 Get笔记 数据
-	async syncGet() {
+	async runSyncLatest(): Promise<void> {
 		try {
-			// 使用 mainUI 的 onSync 方法进行同步
-			const syncBtn = new ButtonComponent(createDiv());
-			await this.mainUI.onSync(syncBtn);
-
-			// 更新最后同步时间
-			this.settings.lastSyncTime = Date.now();
-			await this.saveSettings();
-		} catch (error) {
-			console.error("Auto sync failed:", error);
-			new Notice("Get笔记 auto sync failed: " + error.message);
+			const report = await this.pull.syncLatest((message) => this.reportProgress(message));
+			this.finishProgress(`同步完成：${summariseReport(report)}`);
+			report.failed.slice(0, 3).forEach((failure) => new Notice(`${failure.title}：${failure.error}`, 8000));
+		} catch (error: unknown) {
+			this.finishProgress(`同步失败：${describeFailure(error)}`);
 		}
 	}
 
-	// 执行自动同步
-	// 注意：此方法已废弃，因为 GetCore 不再支持字符串格式输入
-	// 自动同步现在通过 MainUI.onSync() 实现
-	private async runAutoSync(): Promise<void> {
-		console.warn("runAutoSync() 已废弃，请使用 MainUI.onSync() 进行自动同步");
-		// 使用新的同步方法
-		await this.syncGet();
+	async pickKnowledgeBaseAndSync(): Promise<void> {
+		try {
+			const topics = await this.endpoints.listKnowledgeBases();
+			if (topics.length === 0) {
+				new Notice('没有可同步的知识库。');
+				return;
+			}
+			new KnowledgeBasePicker(this.app, topics, (topic) => {
+				void this.pull
+					.syncKnowledgeBase(topic.topicId, (message) => this.reportProgress(message))
+					.then((report) => this.finishProgress(`${topic.name} 同步完成：${summariseReport(report)}`))
+					.catch((error: unknown) => this.finishProgress(`同步失败：${describeFailure(error)}`));
+			}).open();
+		} catch (error: unknown) {
+			new Notice(`知识库读取失败：${describeFailure(error)}`);
+		}
+	}
+
+	async openRecallView(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(RECALL_VIEW_TYPE);
+		const leaf = existing.length > 0 ? existing[0] : this.app.workspace.getRightLeaf(false);
+		if (!leaf) return;
+		await leaf.setViewState({ type: RECALL_VIEW_TYPE, active: true });
+		this.app.workspace.revealLeaf(leaf);
+	}
+
+	async recallText(text: string): Promise<void> {
+		const query = text.trim();
+		if (query.length === 0) {
+			new Notice('没有选中任何文本。');
+			return;
+		}
+		await this.openRecallView();
+		const view = this.app.workspace.getLeavesOfType(RECALL_VIEW_TYPE)[0]?.view;
+		if (view instanceof RecallView) {
+			view.setQuery(query);
+			void view.run();
+		}
+	}
+
+	async pushFile(file: TFile): Promise<void> {
+		try {
+			const result = await this.push.pushFile(file);
+			new Notice(result.created ? `已创建云端笔记（${result.noteId}）` : `已更新云端笔记（${result.noteId}）`);
+		} catch (error: unknown) {
+			new Notice(`推送失败：${describeFailure(error)}`, 8000);
+		}
+	}
+
+	async shareFile(file: TFile): Promise<void> {
+		try {
+			new Notice(`分享链接：${await this.push.shareFile(file)}`, 10_000);
+		} catch (error: unknown) {
+			new Notice(`生成分享链接失败：${describeFailure(error)}`, 8000);
+		}
 	}
 }

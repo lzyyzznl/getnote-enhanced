@@ -1,10 +1,10 @@
 {
-	"id": "get-importer-sync",
-	"name": "Dedao Brain Importer",
-	"version": "3.9.5",
+	"id": "getnote-enhanced",
+	"name": "GetNote Enhanced",
+	"version": "1.0.0",
 	"minAppVersion": "1.5.0",
-	"description": "Import Get笔记 Notes. Supports both Playwright (desktop-only) and OpenAPI (cross-platform) sync channels.",
-	"author": "springrain | 公众号: 及时春雨",
-	"authorUrl": "https://github.com/springrain1",
+	"description": "Sync 得到大脑 (Get笔记) notes into your vault with semantic recall, deep content (transcripts, timelines, meeting todos) and push-back. Requires a 得到大脑 membership.",
+	"author": "lzyyzznl",
+	"authorUrl": "https://github.com/lzyyzznl",
 	"isDesktopOnly": false
 }

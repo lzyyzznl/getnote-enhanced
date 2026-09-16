@@ -1,4 +1,5 @@
 node_modules/
+main.js
 *.js.map
 .DS_Store
 .vscode/
@@ -11,3 +12,4 @@ fix_*.js
 error.log
 .kiro/
 reference/
+.smoke/
